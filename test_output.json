@@ -1,0 +1,17 @@
+[
+  {
+    "question": "Who is the all-time leading scorer in the UEFA Champions League?",
+    "answer": "Ra\u00fal Gonz\u00e1lez with 71 goals",
+    "quality_score": 9.0
+  },
+  {
+    "question": "Who is the current quarterback of the Green Bay Packers?",
+    "answer": "Aaron Rodgers",
+    "quality_score": 8.0
+  },
+  {
+    "question": "Who is the all-time leading scorer in the English Premier League?",
+    "answer": "Alan Shearer with 260 goals",
+    "quality_score": 9.0
+  }
+]
