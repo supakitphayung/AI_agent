@@ -9,7 +9,7 @@ from google.generativeai import GenerativeModel, configure
 
 class GeminiLLM:
     def __init__(self, model="gemini-2.5-flash", api_key=None):
-        configure(api_key=api_key or os.getenv("AIzaSyA_xKBxU1sV3hk2alE0PWofxI1l3PwiTJ0"))
+        configure(api_key=api_key or os.getenv("AIzaSyDjGO4GS5GPbO0-fqX_8qr6M0qhY6BFys0"))
         self.model = GenerativeModel(model)
 
     def invoke(self, prompt: str) -> str:
@@ -228,8 +228,9 @@ class MultiAgentSystem:
             content['quality_score'] = score
             export.append(content)
 
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding="utf-8") as f:
             json.dump(export, f, indent=2, ensure_ascii=False)
+
         print(f"📁 Exported {len(export)} samples to {filename}")
 
     def get_statistics(self):
@@ -305,7 +306,7 @@ class MultiAgentSystem:
 if __name__ == "__main__":
     system = MultiAgentSystem(
         model_name="gemini-2.5-flash",
-        api_key="AIzaSyA_xKBxU1sV3hk2alE0PWofxI1l3PwiTJ0"
+        api_key="AIzaSyDjGO4GS5GPbO0-fqX_8qr6M0qhY6BFys0"
     )
-    system.run_full_pipeline_from_csv("/Users/admin/Downloads/HC_Main_Data3 (1).csv", min_quality=7.5)
+    system.run_full_pipeline_from_csv("/Users/user/Documents/2024intern/DF8ADB5EC86B354685F1B24EA0AB4BE36EDF5DB3_HC_Main_Data3 (1).csv", min_quality=7.5)
 
