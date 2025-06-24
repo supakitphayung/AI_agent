@@ -5,6 +5,9 @@ import re
 import pandas as pd
 from typing import List, Dict
 from google.generativeai import GenerativeModel, configure
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
+import numpy as np
 
 
 class GeminiLLM:
@@ -25,6 +28,7 @@ class MultiAgentSystem:
     def __init__(self, model_name="gemini-2.5-flash", api_key=None):
         self.model_name = model_name
         self.llm = GeminiLLM(model=model_name, api_key=api_key)
+        self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
         if os.path.exists("agent_data.db"):
             os.remove("agent_data.db")
@@ -43,8 +47,7 @@ class MultiAgentSystem:
                 data_type TEXT,
                 word_count INTEGER,
                 question_length INTEGER,
-                answer_length INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                answer_length INTEGER
             )
         ''')
 
@@ -54,27 +57,33 @@ class MultiAgentSystem:
                 raw_id INTEGER,
                 content TEXT,
                 quality_score REAL,
-                filter_reason TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (raw_id) REFERENCES raw_data(id)
+                filter_reason TEXT
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS context_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT,
+                embedding BLOB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
 
         self.conn.commit()
-        print("✅ Database setup complete")
+        print("✅ Database setup complete (QnA + RAG)")
 
-    def agent_1_from_csv(self, file_path: str, max_rows: int = 5, samples_per_row: int = 2) -> List[Dict]:
-        print(f"📄 Agent 1: Creating Q&A from CSV file: {file_path}")
+    def agent_1_from_csv(self, file_path: str, max_rows: int = 5):
+        print(f"📄 Agent 1: Generating Q&A from CSV: {file_path}")
         df = pd.read_csv(file_path)
-        df = df.head(max_rows)  # ✅ อ่านแค่ N แถวแรก
-
-        created_samples = []
+        df = df.head(max_rows)
         cursor = self.conn.cursor()
+        created_samples = []
 
         for i, row in df.iterrows():
             row_text = str(row.to_dict())
 
-            for j in range(samples_per_row):
+            for j in range(2):
                 prompt = f"""
                 สร้างคำถาม-คำตอบ (ภาษาไทย) จากเนื้อหาต่อไปนี้:
 
@@ -85,23 +94,20 @@ class MultiAgentSystem:
                 - ต้องไม่ซ้ำกับคำถามก่อนหน้า
                 - รูปแบบ JSON เท่านั้น:
                 {{
-                "question": "…?",
-                "answer": "…"
+                "question": "...?",
+                "answer": "..."
                 }}
                 """
-
                 try:
                     response = self.llm.invoke(prompt)
                     start = response.find('{')
                     end = response.rfind('}') + 1
                     json_str = response[start:end]
-
                     sample = json.loads(json_str)
                     question = sample.get("question", "")
                     answer = sample.get("answer", "")
 
                     if not question.endswith("?"):
-                        print(f"  ⚠️ Row {i+1}.{j+1} skipped: Question missing '?'")
                         continue
 
                     word_count = len((question + " " + answer).split())
@@ -110,20 +116,15 @@ class MultiAgentSystem:
                         (json.dumps(sample, ensure_ascii=False), "from_csv", word_count, len(question), len(answer))
                     )
                     created_samples.append(sample)
-                    print(f"  ✓ Created Q&A from row {i+1}, version {j+1}")
 
                 except Exception as e:
                     print(f"  ✗ Row {i+1}, version {j+1} error: {e}")
 
         self.conn.commit()
+        print("✅ Q&A Generated")
         return created_samples
 
-
-
-    # === agent_2_quality_filter, agent_3_main_trainer, export_data, get_statistics ตามที่คุณมี ===
-    # (ขอยกเว้นไว้ตรงนี้เพื่อไม่ให้ข้อความยาวเกิน)    
     def agent_2_quality_filter(self, min_quality_score: float = 7.0) -> List[Dict]:
-        print(f"🔍 Agent 2: Filtering with min score {min_quality_score}...")
         cursor = self.conn.cursor()
         cursor.execute("SELECT id, content FROM raw_data")
         raw_samples = cursor.fetchall()
@@ -176,11 +177,9 @@ class MultiAgentSystem:
                 print(f"  ✗ Filter error: {e}")
 
         self.conn.commit()
-        print(f"✅ Agent 2: {len(filtered)} samples passed filter")
         return filtered
 
     def agent_3_main_trainer(self) -> Dict:
-        print("🎯 Agent 3: Simulating training...")
         cursor = self.conn.cursor()
         cursor.execute("SELECT content, quality_score FROM filtered_data")
         data = cursor.fetchall()
@@ -205,7 +204,7 @@ class MultiAgentSystem:
         - Strengths
         - Weaknesses
         - Next steps
-        and give a answer in thai
+        (ตอบเป็นภาษาไทย)
         """
         analysis = self.llm.invoke(prompt)
 
@@ -217,7 +216,57 @@ class MultiAgentSystem:
             "examples": samples[:2]
         }
 
-    def export_data(self, filename="training_data.json"):
+    def agent_rag_import(self, file_path: str, max_rows: int = 5):
+        print(f"📄 Agent RAG: Importing and embedding from CSV: {file_path}")
+        df = pd.read_csv(file_path)
+        df = df.head(max_rows)
+        cursor = self.conn.cursor()
+
+        for i, row in df.iterrows():
+            row_text = " ".join([str(val) for val in row.values if pd.notna(val)])
+            if len(row_text.strip()) < 10:
+                continue
+            embedding = self.embedder.encode(row_text).astype(np.float32).tobytes()
+            cursor.execute("INSERT INTO context_data (content, embedding) VALUES (?, ?)", (row_text, embedding))
+
+        self.conn.commit()
+        print("✅ RAG Context Imported")
+
+    def rag_answer(self, user_question: str, top_k: int = 3) -> str:
+        query_vec = self.embedder.encode([user_question]).astype(np.float32)
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, content, embedding FROM context_data")
+        rows = cursor.fetchall()
+
+        print(f"🔎 มี context ในฐานข้อมูล: {len(rows)} รายการ")
+        if not rows:
+            return "❌ ไม่มีข้อมูล context ในฐานข้อมูล"
+
+        contexts = [(content, np.frombuffer(embedding, dtype=np.float32)) for _, content, embedding in rows]
+        matrix = np.vstack([vec for _, vec in contexts])
+
+        print(f"🔎 embedding matrix shape: {matrix.shape}")
+        sims = cosine_similarity(query_vec, matrix)[0]
+        top_indices = np.argsort(sims)[::-1][:top_k]
+
+        print(f"🔎 Top similarity scores: {[sims[i] for i in top_indices]}")
+
+        context_text = "\n".join([f"- {contexts[i][0]}" for i in top_indices])
+
+        prompt = f"""
+        คุณคือตัวช่วย AI ที่ตอบคำถามจากข้อมูลที่ให้เท่านั้น
+
+        ข้อมูล:
+        {context_text}
+
+        คำถาม: {user_question}
+
+        หากไม่มีข้อมูลให้ตอบว่า "ไม่พบข้อมูลใน dataset"
+        """
+        return self.llm.invoke(prompt)
+
+
+    def export_data(self, filename="filtered_output.json"):
         cursor = self.conn.cursor()
         cursor.execute("SELECT content, quality_score FROM filtered_data")
         data = cursor.fetchall()
@@ -231,8 +280,6 @@ class MultiAgentSystem:
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(export, f, indent=2, ensure_ascii=False)
 
-        print(f"📁 Exported {len(export)} samples to {filename}")
-
     def get_statistics(self):
         cursor = self.conn.cursor()
         cursor.execute("SELECT COUNT(*), AVG(word_count), AVG(question_length), AVG(answer_length) FROM raw_data")
@@ -243,70 +290,56 @@ class MultiAgentSystem:
         print(f"- Avg Question Length: {avg_qlen:.2f}")
         print(f"- Avg Answer Length: {avg_alen:.2f}")
 
+    def run_full_pipeline_from_csv(self, csv_path: str, min_quality: float = 7.5, mode: str = "qna"):
+        print(f"\n🚀 Starting Multi-Agent Pipeline in mode: {mode.upper()}\n{'='*50}")
 
-    def run_pipeline_from_excel(self, excel_path: str, sheet_name: str = None, min_quality: float = 7.5):
-        print(f"\n🚀 Starting Excel-based Multi-Agent Pipeline: {excel_path}")
-        print("="*50)
+        if mode == "qna":
+            raw = self.agent_1_from_csv(csv_path)
+            if not raw:
+                print("❌ No data generated")
+                return
 
-        print("STEP 1: IMPORT + Q&A CREATION")
-        raw = self.agent_1_from_excel(excel_path, sheet_name)
-        if not raw:
-            print("❌ No data generated from Excel")
-            return
+            filtered = self.agent_2_quality_filter(min_quality)
+            if not filtered:
+                print("❌ No samples passed filter")
+                return
 
-        print("\nSTEP 2: QUALITY FILTER")
-        filtered = self.agent_2_quality_filter(min_quality)
-        if not filtered:
-            print("❌ No samples passed quality check")
-            return
+            result = self.agent_3_main_trainer()
+            if result["status"] == "success":
+                print("\n📊 Summary:")
+                print(f"✓ {result['count']} samples used")
+                print(f"✓ Avg score: {result['average_score']:.2f}")
+                print(result['summary'])
 
-        print("\nSTEP 3: SIMULATE TRAINING")
-        result = self.agent_3_main_trainer()
-        if result["status"] == "success":
-            print("\n📊 Summary:")
-            print(f"✓ {result['count']} samples used")
-            print(f"✓ Avg score: {result['average_score']:.2f}")
-            print(result['summary'])
+            self.export_data("filtered_output.json")
+            self.get_statistics()
 
-        self.export_data("filtered_output.json")
-        self.get_statistics()
+        elif mode == "rag":
+            self.agent_rag_import(csv_path)
+            print("✅ RAG pipeline complete")
+        else:
+            print("❌ Invalid mode. Use 'qna' or 'rag'")
 
-
-# =========================
-# ✅ Usage
-# =========================
-
-    def run_full_pipeline_from_csv(self, csv_path: str, min_quality: float = 7.5):
-        print(f"\n🚀 Starting CSV-based Multi-Agent Pipeline: {csv_path}")
-        print("="*50)
-
-        print("STEP 1: DATA CREATION")
-        raw = self.agent_1_from_csv(csv_path)
-        if not raw:
-            print("❌ No data generated")
-            return
-
-        print("\nSTEP 2: QUALITY FILTER")
-        filtered = self.agent_2_quality_filter(min_quality)
-        if not filtered:
-            print("❌ No samples passed filter")
-            return
-
-        print("\nSTEP 3: SIMULATE TRAINING")
-        result = self.agent_3_main_trainer()
-        if result["status"] == "success":
-            print("\n📊 Summary:")
-            print(f"✓ {result['count']} samples used")
-            print(f"✓ Avg score: {result['average_score']:.2f}")
-            print(result['summary'])
-
-        self.export_data("filtered_output.json")
-        self.get_statistics()
 
 if __name__ == "__main__":
-    system = MultiAgentSystem(
-        model_name="gemini-2.5-flash",
-        api_key="AIzaSyDjGO4GS5GPbO0-fqX_8qr6M0qhY6BFys0"
-    )
-    system.run_full_pipeline_from_csv("/Users/user/Documents/2024intern/DF8ADB5EC86B354685F1B24EA0AB4BE36EDF5DB3_HC_Main_Data3 (1).csv", min_quality=7.5)
+    api_key = os.getenv("GEMINI_API_KEY") or "AIzaSyDjGO4GS5GPbO0-fqX_8qr6M0qhY6BFys0"
+    system = MultiAgentSystem(model_name="gemini-2.5-flash", api_key=api_key)
 
+    csv_file = "/Users/user/Documents/2024intern/DF8ADB5EC86B354685F1B24EA0AB4BE36EDF5DB3_HC_Main_Data3 (1).csv"
+
+    # Mode QnA
+    system.run_full_pipeline_from_csv(csv_file, min_quality=7.5, mode="qna")
+
+    # Mode RAG
+    system.run_full_pipeline_from_csv(csv_file, mode="rag")
+
+    # Example RAG Query
+    while True:
+        user_question = input("\n💬 พิมพ์คำถามของคุณ (หรือพิมพ์ 'exit' เพื่อออก): ")
+        if user_question.strip().lower() in ["exit", "quit"]:
+            print("👋 จบการทำงานของระบบ RAG แล้ว")
+            break
+
+        answer = system.rag_answer(user_question)
+        print("\n🔍 คำตอบจาก RAG:")
+        print(answer)
