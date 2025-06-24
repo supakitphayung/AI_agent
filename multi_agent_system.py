@@ -1,37 +1,52 @@
-# Multi-Agent System with Ollama
-# Install required packages first:
-# pip install langchain-ollama pandas sqlite3
-
 import json
 import sqlite3
-import pandas as pd
-from datetime import datetime
-from langchain_ollama import OllamaLLM
-from typing import List, Dict, Any
 import os
+import re
+from typing import List, Dict
+from google.generativeai import GenerativeModel, configure
+
+
+class GeminiLLM:
+    def __init__(self, model="gemini-2.5-flash", api_key=None):
+        configure(api_key=api_key or os.getenv("AIzaSyBzVdrsbkQL7qXmcSZNbVs8kN7jyVfqzF0"))
+        self.model = GenerativeModel(model)
+
+    def invoke(self, prompt: str) -> str:
+        try:
+            response = self.model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            print("✗ Gemini error:", e)
+            return ""
+
 
 class MultiAgentSystem:
-    def __init__(self, model_name="llama3.2"):
+    def __init__(self, model_name="gemini-2.5-flash", api_key=None):
         self.model_name = model_name
-        self.llm = OllamaLLM(model=model_name)
+        self.llm = GeminiLLM(model=model_name, api_key=api_key)
+
+        if os.path.exists("agent_data.db"):
+            os.remove("agent_data.db")
+            print("🗑️ Deleted old database file")
+
         self.setup_database()
-        
+
     def setup_database(self):
-        """Initialize SQLite database for storing data between agents"""
-        self.conn = sqlite3.connect('agent_data.db')
+        self.conn = sqlite3.connect("agent_data.db")
         cursor = self.conn.cursor()
-        
-        # Table for raw data from Agent 1
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS raw_data (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 content TEXT,
                 data_type TEXT,
+                word_count INTEGER,
+                question_length INTEGER,
+                answer_length INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
-        # Table for filtered data from Agent 2
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS filtered_data (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,241 +55,220 @@ class MultiAgentSystem:
                 quality_score REAL,
                 filter_reason TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (raw_id) REFERENCES raw_data (id)
+                FOREIGN KEY (raw_id) REFERENCES raw_data(id)
             )
         ''')
-        
+
         self.conn.commit()
-    
-    def agent_1_data_creator(self, topic: str, num_samples: int = 5) -> List[Dict]:
-        """Agent 1: Creates synthetic training data"""
+        print("✅ Database setup complete")
+
+    def agent_1_data_creator(self, topic: str = "bank of thailand regulation", num_samples: int = 5) -> List[Dict]:
         print(f"🤖 Agent 1: Creating {num_samples} data samples about '{topic}'...")
-        
-        # Create samples one by one to avoid JSON parsing issues
         created_samples = []
         cursor = self.conn.cursor()
-        
+
         for i in range(num_samples):
             prompt = f"""
-            Create 1 question-answer pair about {topic}.
-            Keep answers under 200 words.
-            Format as valid JSON:
-            {{"question": "your question here", "answer": "your answer here"}}
-            
-            Return ONLY the JSON object, nothing else.
+            Forget previous context.
+
+            Create a unique and different question-answer pair strictly about the topic: "{topic}".
+            Each sample must focus on a different sub-topic ex. stats of premier league players or another league and don't give a rule of football.
+            Avoid repeating questions and facts or the same field of questions. Ensure the answer is under 200 words and factually correct.and the most important 
+            thing is give a answer shortly. gen answer and question in thai
+            Format as JSON:
+            {{
+            "question": "your question here?",
+            "answer": "your answer here"
+            }}
+
+            Return ONLY the JSON object.
             """
-            
             try:
                 response = self.llm.invoke(prompt)
-                
-                # Clean up response - remove extra text before/after JSON
-                response = response.strip()
-                
-                # Find JSON object in response
                 start = response.find('{')
                 end = response.rfind('}') + 1
-                
-                if start != -1 and end > start:
-                    json_str = response[start:end]
-                    sample = json.loads(json_str)
-                    
-                    # Validate that it has required fields
-                    if 'question' in sample and 'answer' in sample:
-                        cursor.execute(
-                            "INSERT INTO raw_data (content, data_type) VALUES (?, ?)",
-                            (json.dumps(sample), topic)
-                        )
-                        sample_id = cursor.lastrowid
-                        created_samples.append({
-                            'id': sample_id,
-                            'content': sample,
-                            'data_type': topic
-                        })
-                        print(f"  ✓ Created sample {i+1}/{num_samples}")
-                    else:
-                        print(f"  ✗ Sample {i+1} missing required fields")
-                else:
-                    print(f"  ✗ Sample {i+1} no valid JSON found")
-                    
-            except json.JSONDecodeError as e:
-                print(f"  ✗ Sample {i+1} JSON parse error: {e}")
-                print(f"    Response: {response[:100]}...")
+                json_str = response[start:end]
+
+                if not json_str:
+                    print(f"  ✗ Sample {i+1} skipped: Empty or invalid JSON")
+                    continue
+
+                sample = json.loads(json_str)
+                question = sample.get("question", "")
+                answer = sample.get("answer", "")
+
+                if not question.endswith("?"):
+                    print(f"  ⚠️ Sample {i+1} skipped: Question missing '?'")
+                    continue
+
+                word_count = len((question + " " + answer).split())
+                question_len = len(question)
+                answer_len = len(answer)
+
+                cursor.execute(
+                    "INSERT INTO raw_data (content, data_type, word_count, question_length, answer_length) VALUES (?, ?, ?, ?, ?)",
+                    (json.dumps(sample), topic, word_count, question_len, answer_len)
+                )
+                created_samples.append(sample)
+                print(f"  ✓ Created sample {i+1}/{num_samples}")
+
             except Exception as e:
                 print(f"  ✗ Sample {i+1} error: {e}")
-        
+
         self.conn.commit()
-        print(f"✅ Agent 1: Successfully created {len(created_samples)} samples")
         return created_samples
-    
+
     def agent_2_quality_filter(self, min_quality_score: float = 7.0) -> List[Dict]:
-        """Agent 2: Filters data based on quality criteria"""
-        print(f"🔍 Agent 2: Filtering data with minimum quality score {min_quality_score}...")
-        
-        # Get all raw data
+        print(f"🔍 Agent 2: Filtering with min score {min_quality_score}...")
         cursor = self.conn.cursor()
-        cursor.execute("SELECT id, content, data_type FROM raw_data")
+        cursor.execute("SELECT id, content FROM raw_data")
         raw_samples = cursor.fetchall()
-        
-        filtered_samples = []
-        
-        for sample_id, content_str, data_type in raw_samples:
+
+        filtered = []
+        for sample_id, content_str in raw_samples:
+            content = json.loads(content_str)
+            q = content['question']
+            a = content['answer']
+
+            eval_prompt = f"""
+            Evaluate the following question-answer pair:
+
+            Question: {q}
+            Answer: {a}
+
+            Provide these scores (1–10 only):
+            - Accuracy:
+            - Clarity:
+            - Completeness:
+            - Grammar:
+            Then give:
+
+            Overall Score: (1–10 only)
+            Reason: A brief reason in 1–2 sentences
+
+            Output format:
+            Accuracy: X
+            Clarity: X
+            Completeness: X
+            Grammar: X
+            Overall Score: X
+            Reason: Y
+            """
             try:
-                content = json.loads(content_str)
-                
-                # Quality evaluation prompt
-                eval_prompt = f"""
-                Evaluate this Q&A pair for quality on a scale of 1-10:
-                Question: {content.get('question', '')}
-                Answer: {content.get('answer', '')}
-                
-                Consider:
-                - Clarity and specificity of question
-                - Accuracy and completeness of answer
-                - Educational value
-                - Proper grammar and formatting
-                
-                Respond with only a number (1-10) and brief reason.
-                Format: "Score: X, Reason: brief explanation"
-                """
-                
-                eval_response = self.llm.invoke(eval_prompt)
-                
-                # Parse quality score
-                try:
-                    score_line = eval_response.split('\n')[0]
-                    score = float(score_line.split(':')[1].split(',')[0].strip())
-                    reason = eval_response.split('Reason:')[1].strip() if 'Reason:' in eval_response else "No reason provided"
-                except:
-                    score = 5.0  # Default score if parsing fails
-                    reason = "Parsing failed"
-                
+                result = self.llm.invoke(eval_prompt)
+                match = re.search(r'Overall Score[:\s]*([\d.]+)', result)
+                score_raw = float(match.group(1)) if match else 5.0
+                score = min(score_raw, 10.0)
+                reason = result.split("Reason:")[-1].strip() if "Reason:" in result else "N/A"
+
                 if score >= min_quality_score:
                     cursor.execute(
                         "INSERT INTO filtered_data (raw_id, content, quality_score, filter_reason) VALUES (?, ?, ?, ?)",
                         (sample_id, content_str, score, reason)
                     )
-                    filtered_samples.append({
-                        'id': sample_id,
-                        'content': content,
-                        'quality_score': score,
-                        'reason': reason
-                    })
-                    
+                    filtered.append(content)
+
             except Exception as e:
-                print(f"Error processing sample {sample_id}: {e}")
-        
+                print(f"  ✗ Filter error: {e}")
+
         self.conn.commit()
-        print(f"✅ Agent 2: Filtered {len(filtered_samples)} quality samples")
-        return filtered_samples
-    
+        print(f"✅ Agent 2: {len(filtered)} samples passed filter")
+        return filtered
+
     def agent_3_main_trainer(self) -> Dict:
-        """Agent 3: Uses filtered data for training/fine-tuning simulation"""
-        print("🎯 Agent 3: Preparing training data and simulating training...")
-        
-        # Get filtered data
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT content, quality_score FROM filtered_data")
-        training_data = cursor.fetchall()
-        
-        if not training_data:
-            return {"status": "error", "message": "No filtered data available for training"}
-        
-        # Simulate training process
-        training_samples = []
-        total_quality = 0
-        
-        for content_str, quality_score in training_data:
-            content = json.loads(content_str)
-            training_samples.append(content)
-            total_quality += quality_score
-        
-        avg_quality = total_quality / len(training_data)
-        
-        # Generate training summary
-        summary_prompt = f"""
-        Analyze this training dataset of {len(training_samples)} Q&A pairs.
-        Average quality score: {avg_quality:.2f}
-        
-        Sample questions: {[sample['question'][:50] + '...' for sample in training_samples[:3]]}
-        
-        Provide a brief training summary including:
-        - Dataset strengths
-        - Potential areas for improvement
-        - Recommended next steps
-        """
-        
-        training_analysis = self.llm.invoke(summary_prompt)
-        
-        result = {
-            "status": "success",
-            "training_samples": len(training_samples),
-            "average_quality": avg_quality,
-            "analysis": training_analysis,
-            "sample_data": training_samples[:2]  # Show first 2 samples
-        }
-        
-        print(f"✅ Agent 3: Training simulation complete")
-        return result
-    
-    def run_full_pipeline(self, topic: str, num_samples: int = 5, min_quality: float = 7.0):
-        """Run the complete multi-agent pipeline"""
-        print(f"\n🚀 Starting Multi-Agent Pipeline for topic: '{topic}'\n")
-        
-        # Step 1: Data Creation
-        raw_data = self.agent_1_data_creator(topic, num_samples)
-        if not raw_data:
-            print("❌ Pipeline failed at data creation step")
-            return
-        
-        # Step 2: Quality Filtering
-        filtered_data = self.agent_2_quality_filter(min_quality)
-        if not filtered_data:
-            print("❌ Pipeline failed: No data passed quality filter")
-            return
-        
-        # Step 3: Training Simulation
-        training_result = self.agent_3_main_trainer()
-        
-        # Final Summary
-        print(f"\n📊 Pipeline Summary:")
-        print(f"Raw samples created: {len(raw_data)}")
-        print(f"Samples passed filter: {len(filtered_data)}")
-        print(f"Training status: {training_result['status']}")
-        
-        if training_result['status'] == 'success':
-            print(f"Average quality score: {training_result['average_quality']:.2f}")
-            print(f"\nTraining Analysis:\n{training_result['analysis']}")
-        
-        return training_result
-    
-    def export_data(self, filename: str = "training_data.json"):
-        """Export filtered data for external use"""
+        print("🎯 Agent 3: Simulating training...")
         cursor = self.conn.cursor()
         cursor.execute("SELECT content, quality_score FROM filtered_data")
         data = cursor.fetchall()
-        
-        export_data = []
-        for content_str, quality_score in data:
-            content = json.loads(content_str)
-            content['quality_score'] = quality_score
-            export_data.append(content)
-        
-        with open(filename, 'w') as f:
-            json.dump(export_data, f, indent=2)
-        
-        print(f"📁 Exported {len(export_data)} samples to {filename}")
 
-# Example usage
+        if not data:
+            return {"status": "error", "message": "No filtered data available"}
+
+        samples = []
+        total_score = 0
+        for content_str, score in data:
+            content = json.loads(content_str)
+            samples.append(content)
+            total_score += score
+
+        avg = total_score / len(samples)
+        prompt = f"""
+        Analyze training data of {len(samples)} pairs.
+        Avg score: {avg:.2f}
+        Example questions: {[s['question'][:40] for s in samples[:3]]}
+
+        Give summary with:
+        - Strengths
+        - Weaknesses
+        - Next steps
+        and give a answer in thai
+        """
+        analysis = self.llm.invoke(prompt)
+
+        return {
+            "status": "success",
+            "count": len(samples),
+            "average_score": avg,
+            "summary": analysis,
+            "examples": samples[:2]
+        }
+
+    def export_data(self, filename="training_data.json"):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT content, quality_score FROM filtered_data")
+        data = cursor.fetchall()
+
+        export = []
+        for content_str, score in data:
+            content = json.loads(content_str)
+            content['quality_score'] = score
+            export.append(content)
+
+        with open(filename, "w") as f:
+            json.dump(export, f, indent=2, ensure_ascii=False)
+        print(f"📁 Exported {len(export)} samples to {filename}")
+
+    def get_statistics(self):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*), AVG(word_count), AVG(question_length), AVG(answer_length) FROM raw_data")
+        count, avg_words, avg_qlen, avg_alen = cursor.fetchone()
+        print("📊 Stats:")
+        print(f"- Total Samples: {count}")
+        print(f"- Avg Words: {avg_words:.2f}")
+        print(f"- Avg Question Length: {avg_qlen:.2f}")
+        print(f"- Avg Answer Length: {avg_alen:.2f}")
+
+    def run_full_pipeline(self, topic="football", num_samples=5, min_quality=7.0):
+        print(f"\n🚀 Starting Enhanced Multi-Agent Pipeline for topic: '{topic}'")
+        print(f"Samples: {num_samples}, Min Quality: {min_quality}")
+        print("="*50)
+
+        print("STEP 1: DATA CREATION")
+        raw = self.agent_1_data_creator(topic, num_samples)
+        if not raw:
+            print("❌ No data generated")
+            return
+
+        print("\nSTEP 2: QUALITY FILTER")
+        filtered = self.agent_2_quality_filter(min_quality)
+        if not filtered:
+            print("❌ No samples passed filter")
+            return
+
+        print("\nSTEP 3: TRAINING SIMULATION")
+        result = self.agent_3_main_trainer()
+        if result["status"] == "success":
+            print("\n📊 Summary:")
+            print(f"✓ {result['count']} samples used")
+            print(f"✓ Avg score: {result['average_score']:.2f}")
+            print(result['summary'])
+        self.export_data("filtered_output.json")
+        self.get_statistics()
+
+
+# ================================
+# Usage example
+# ================================
 if __name__ == "__main__":
-    # Initialize the system
-    system = MultiAgentSystem(model_name="llama3.2")  # Change model if needed
-    
-    # Run the pipeline
-    result = system.run_full_pipeline(
-        topic="Python programming basics",
-        num_samples=8,
-        min_quality=6.0
-    )
-    
-    # Export the data
-    system.export_data("python_training_data.json")
+    system = MultiAgentSystem(model_name="gemini-2.5-flash", api_key="AIzaSyBzVdrsbkQL7qXmcSZNbVs8kN7jyVfqzF0")
+    system.run_full_pipeline(topic="bank of thailand regulation", num_samples=20, min_quality=7.5)

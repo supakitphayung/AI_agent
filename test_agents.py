@@ -1,29 +1,25 @@
-# Quick test script - save as test_agents.py
 from multi_agent_system import MultiAgentSystem
+from google.generativeai import configure
+
+configure(api_key="AIzaSyBzVdrsbkQL7qXmcSZNbVs8kN7jyVfqzF0")
 
 def quick_test():
     print("🧪 Testing Multi-Agent System...")
-    
-    # Initialize with your Ollama model
-    system = MultiAgentSystem(model_name="llama3.2")  # or whatever model you have
-    
-    # Test with a simple topic
+
+    system = MultiAgentSystem(model_name="gemini-2.5-flash")
+
     result = system.run_full_pipeline(
-        topic="football",
-        num_samples=3,  # Start small for testing
-        min_quality=5.0  # Lower threshold for testing
+        topic="krungthai bank",
+        num_samples=3,
+        min_quality=5.0
     )
-    
-    if result and result['status'] == 'success':
+
+    if result and result.get('status') == 'success':
         print("\n🎉 Success! Your multi-agent system is working!")
-        
-        # Show some sample data
-        print("\nSample training data:")
-        for i, sample in enumerate(result['sample_data'], 1):
+        for i, sample in enumerate(result.get('examples', []), 1):
             print(f"\n{i}. Q: {sample['question']}")
             print(f"   A: {sample['answer'][:100]}...")
-    
-    # Export the data
+
     system.export_data("test_output.json")
 
 if __name__ == "__main__":
